@@ -17,3 +17,4 @@ dependencies:
     - opencv-python-headless
     - matplotlib
     - tqdm
+    - numpy
