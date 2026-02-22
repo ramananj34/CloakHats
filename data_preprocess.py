@@ -40,16 +40,33 @@ def segment_green_hat(frame):
     kernel = np.ones((5, 5), np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-    #Keep only largest connected component BEFORE dilation
+    #Keep only largest connected component
     num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
     if num_labels <= 1:
         return mask
     largest_label = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
     mask = np.where(labels == largest_label, 255, 0).astype(np.uint8)
-    # Now dilate only the hat blob
+    #Dilate
     dilate_kernel = np.ones((15, 15), np.uint8)
     mask = cv2.dilate(mask, dilate_kernel, iterations=1)
     
+    #Second pass: keep only largest component AFTER dilation
+    #(dilation can bridge to nearby noise)
+    num_labels2, labels2, stats2, centroids2 = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    if num_labels2 > 2:
+        largest_label2 = 1 + np.argmax(stats2[1:, cv2.CC_STAT_AREA])
+        mask = np.where(labels2 == largest_label2, 255, 0).astype(np.uint8)
+    #Safety: remove any pixels far from centroid
+    ys, xs = np.where(mask > 0)
+    if len(ys) > 0:
+        cy, cx = np.mean(ys), np.mean(xs)
+        dists = np.sqrt((ys - cy)**2 + (xs - cx)**2)
+        # Max radius = 2x the radius of a circle with same area
+        area = len(ys)
+        max_radius = 2.0 * np.sqrt(area / np.pi)
+        outliers = dists > max_radius
+        if outliers.any():
+            mask[ys[outliers], xs[outliers]] = 0
     return mask
 
 def extract_metadata(image_path):
