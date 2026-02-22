@@ -40,8 +40,16 @@ def segment_green_hat(frame):
     kernel = np.ones((5, 5), np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    #Keep only largest connected component BEFORE dilation
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    if num_labels <= 1:
+        return mask
+    largest_label = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
+    mask = np.where(labels == largest_label, 255, 0).astype(np.uint8)
+    # Now dilate only the hat blob
     dilate_kernel = np.ones((15, 15), np.uint8)
     mask = cv2.dilate(mask, dilate_kernel, iterations=1)
+    
     return mask
 
 def extract_metadata(image_path):
@@ -140,6 +148,15 @@ for img_path in raw_images:
 
     bbox = [float(b) for b in best_bbox]
     bx1, by1, bx2, by2 = [int(b) for b in bbox]
+
+    # Zero out mask outside 1.5x expanded person bbox
+    bw, bh = bx2 - bx1, by2 - by1
+    pad_x, pad_y = int(bw * 0.25), int(bh * 0.25)
+    h, w = mask.shape[:2]
+    bbox_mask = np.zeros_like(mask)
+    bbox_mask[max(by1-pad_y,0):min(by2+pad_y,h), max(bx1-pad_x,0):min(bx2+pad_x,w)] = 255
+    mask = cv2.bitwise_and(mask, bbox_mask)
+    
     mask_in_bbox = np.count_nonzero(mask[by1:by2, bx1:bx2])
     if mask_in_bbox < MIN_MASK_AREA:
         logger.warning(f"  SKIP {img_path.name}: hat mask outside person bbox")
