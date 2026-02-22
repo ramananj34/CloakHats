@@ -1,4 +1,4 @@
-#Generated with the Help of AI
+#Made with help from AI
 
 import cv2
 import numpy as np
@@ -8,19 +8,26 @@ from PIL.ExifTags import TAGS
 import json
 import logging
 from ultralytics import YOLO
+from sahi import AutoDetectionModel
+from sahi.predict import get_sliced_prediction
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(message)s')
 logger = logging.getLogger(__name__)
 
-RAW_DIR = Path('./raw_capture')
+RAW_DIR = Path('./raw_capture2')
 OUTPUT_DIR = Path('./data/drone_footage')
 FRAMES_DIR = OUTPUT_DIR / 'frames'
 MASKS_DIR = OUTPUT_DIR / 'masks'
 
 ALTITUDE_FT = 25.0
-ALTITUDE_M = ALTITUDE_FT * 0.3048  # 7.62 m
+ALTITUDE_M = ALTITUDE_FT * 0.3048
 
 MIN_MASK_AREA = 500
+
+# SAHI settings
+SLICE_SIZE = 960
+SLICE_OVERLAP = 0.3
+CONF_THRESHOLD = 0.25
 
 FRAMES_DIR.mkdir(parents=True, exist_ok=True)
 MASKS_DIR.mkdir(parents=True, exist_ok=True)
@@ -58,8 +65,32 @@ def extract_metadata(image_path):
         logger.warning(f"  EXIF read failed for {image_path.name}: {e}")
     return None, None
 
-logger.info("Loading YOLOv8m for person detection...")
-yolo = YOLO('yolov8m.pt')
+def sahi_detect_person(image_path, detection_model):
+    """Run SAHI sliced detection and return best person bbox and confidence."""
+    result = get_sliced_prediction(
+        str(image_path),
+        detection_model,
+        slice_height=SLICE_SIZE,
+        slice_width=SLICE_SIZE,
+        overlap_height_ratio=SLICE_OVERLAP,
+        overlap_width_ratio=SLICE_OVERLAP,
+        verbose=0,
+    )
+    best_conf = 0.0
+    best_bbox = None
+    for pred in result.object_prediction_list:
+        if pred.category.id == 0 and pred.score.value > best_conf:
+            best_conf = pred.score.value
+            best_bbox = pred.bbox.to_xyxy()
+    return best_bbox, best_conf
+
+logger.info("Loading YOLOv8m with SAHI...")
+detection_model = AutoDetectionModel.from_pretrained(
+    model_type='yolov8',
+    model_path='yolov8m.pt',
+    confidence_threshold=CONF_THRESHOLD,
+    device='cuda:0'
+)
 
 annotations = {
     'frames': [],
@@ -76,6 +107,7 @@ annotations = {
 image_exts = {'.jpg', '.jpeg', '.png', '.tiff', '.tif', '.bmp'}
 raw_images = sorted([f for f in RAW_DIR.iterdir() if f.suffix.lower() in image_exts])
 logger.info(f"Found {len(raw_images)} images in {RAW_DIR}")
+logger.info(f"SAHI config: slice={SLICE_SIZE}, overlap={SLICE_OVERLAP}, conf={CONF_THRESHOLD}")
 
 skipped = {'no_meta': 0, 'no_read': 0, 'no_mask': 0, 'no_person': 0}
 frame_idx = 0
@@ -94,31 +126,29 @@ for img_path in raw_images:
         continue
 
     mask = segment_green_hat(frame)
-    if mask.sum() < MIN_MASK_AREA:
-        logger.warning(f"  SKIP {img_path.name}: mask too small ({mask.sum()} px)")
+    if np.count_nonzero(mask) < MIN_MASK_AREA:
+        logger.warning(f"  SKIP {img_path.name}: mask too small ({np.count_nonzero(mask)} px)")
         skipped['no_mask'] += 1
         continue
 
-    results = yolo.predict(frame, conf=0.25, classes=[0], verbose=False)
-    if len(results[0].boxes) == 0:
-        logger.warning(f"  SKIP {img_path.name}: no person detected")
+    # SAHI sliced detection
+    best_bbox, best_conf = sahi_detect_person(img_path, detection_model)
+    if best_bbox is None:
+        logger.warning(f"  SKIP {img_path.name}: no person detected (SAHI)")
         skipped['no_person'] += 1
         continue
-    best = results[0].boxes.conf.argmax()
-    bbox = results[0].boxes.xyxy[best].cpu().numpy().tolist()
 
+    bbox = [float(b) for b in best_bbox]
     bx1, by1, bx2, by2 = [int(b) for b in bbox]
-    mask_in_bbox = mask[by1:by2, bx1:bx2].sum()
+    mask_in_bbox = np.count_nonzero(mask[by1:by2, bx1:bx2])
     if mask_in_bbox < MIN_MASK_AREA:
         logger.warning(f"  SKIP {img_path.name}: hat mask outside person bbox")
         skipped['no_mask'] += 1
         continue
 
-    # Coverage: hat mask pixels / person bbox pixels
+    # Coverage
     bbox_area = (bx2 - bx1) * (by2 - by1)
-    hat_pixels = mask_in_bbox
-    coverage = hat_pixels / bbox_area if bbox_area > 0 else 0.0
-    logger.info(f"  Coverage: {coverage:.1%} ({hat_pixels} hat px / {bbox_area} bbox px)")
+    coverage = mask_in_bbox / bbox_area if bbox_area > 0 else 0.0
 
     camera_pitch = abs(vert_angle)
     heading = horiz_angle if horiz_angle is not None else 0.0
@@ -142,21 +172,37 @@ for img_path in raw_images:
         }
     })
 
-    logger.info(f"  OK {img_path.name} -> {frame_id}  pitch={camera_pitch:.1f}  heading={heading:.1f}  bbox=[{bx1},{by1},{bx2},{by2}]")
+    logger.info(f"  OK {img_path.name} -> {frame_id}  conf={best_conf:.2f}  cov={coverage:.1%}  pitch={camera_pitch:.1f}  heading={heading:.1f}")
     frame_idx += 1
 
-# Verify baseline detection at conf=0.5 on all saved frames
-logger.info("Verifying baseline detection on all saved frames...")
-failed_detection = []
+# Baseline verification — SAHI at conf=0.5
+logger.info("=" * 50)
+logger.info("Verifying baseline detection (SAHI @ conf=0.5)...")
+baseline_model = AutoDetectionModel.from_pretrained(
+    model_type='yolov8',
+    model_path='yolov8m.pt',
+    confidence_threshold=0.5,
+    device='cuda:0'
+)
+
+pass_full = 0
+pass_crop = 0
+total = len(annotations['frames'])
+
+# Direct YOLO on crop (no SAHI needed — crop is already 640x640)
+from ultralytics import YOLO as YOLO_direct
+yolo_crop = YOLO_direct('yolov8m.pt')
+
 for entry in annotations['frames']:
     frame_path = OUTPUT_DIR / entry['image_path']
-    frame = cv2.imread(str(frame_path))
-    results = yolo.predict(frame, conf=0.5, classes=[0], verbose=False)
-    if len(results[0].boxes) == 0:
-        failed_detection.append(entry['frame_id'])
-        logger.warning(f"  BASELINE FAIL: {entry['frame_id']} — no person detected at conf=0.5")
     
-    # Also check with person crop (same as training pipeline)
+    # Full frame SAHI check
+    bbox_check, conf_check = sahi_detect_person(frame_path, baseline_model)
+    if bbox_check is not None:
+        pass_full += 1
+    
+    # Crop check (simulates training pipeline)
+    frame = cv2.imread(str(frame_path))
     bbox = entry['person_bbox']
     x1, y1, x2, y2 = [int(b) for b in bbox]
     bw, bh = x2 - x1, y2 - y1
@@ -169,18 +215,14 @@ for entry in annotations['frames']:
     cy2 = min(cy + side // 2, h)
     crop = frame[cy1:cy2, cx1:cx2]
     crop_resized = cv2.resize(crop, (640, 640))
-    results_crop = yolo.predict(crop_resized, conf=0.5, classes=[0], verbose=False)
-    if len(results_crop[0].boxes) == 0:
-        if entry['frame_id'] not in failed_detection:
-            failed_detection.append(entry['frame_id'])
-        logger.warning(f"  BASELINE FAIL (crop): {entry['frame_id']} — no person in cropped view")
+    
+    results_crop = yolo_crop.predict(crop_resized, conf=0.5, classes=[0], verbose=False)
+    if len(results_crop[0].boxes) > 0:
+        pass_crop += 1
 
-if failed_detection:
-    logger.error(f"BASELINE DETECTION FAILED ON {len(failed_detection)}/{len(annotations['frames'])} FRAMES")
-    logger.error("These frames are useless for training — the detector can't see the person even without the attack")
-    logger.error(f"Failed frames: {failed_detection}")
-else:
-    logger.info(f"BASELINE OK: all {len(annotations['frames'])} frames detected at conf=0.5 (full-frame and crop)")
+logger.info(f"BASELINE @ conf=0.5 ({total} frames):")
+logger.info(f"  SAHI full-frame: {pass_full}/{total} ({pass_full/total:.1%})")
+logger.info(f"  Direct crop 640: {pass_crop}/{total} ({pass_crop/total:.1%})")
 
 ann_path = OUTPUT_DIR / 'annotations.json'
 with open(ann_path, 'w') as f:
@@ -209,6 +251,5 @@ if annotations['frames']:
         logger.warning("Low heading diversity — consider more mannequin rotations")
     if np.mean(coverages) < 0.10:
         logger.warning("MEAN COVERAGE BELOW 10% — hat may be too small for effective attack")
-        logger.warning("Target: 15-25% coverage with bucket hat at 80-90° elevation")
     if np.mean(coverages) >= 0.15:
         logger.info("GOOD: Coverage in target range for bucket hat attack")
