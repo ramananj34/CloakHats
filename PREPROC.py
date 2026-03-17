@@ -1,4 +1,4 @@
-## THIS WAS MADE WITH AI
+### THIS WAS MADE WITH AI
 
 """
 preprocess_drone_footage.py
@@ -55,8 +55,7 @@ MANNEQUIN_HEIGHT_FT = 6.0
 MANNEQUIN_HEIGHT_M = MANNEQUIN_HEIGHT_FT * 0.3048
 
 # Person detection
-PERSON_CONF_THRESHOLD = 0.25      # YOLO confidence for person detection
-MAX_PERSONS_ALLOWED = 1           # discard frame if more persons detected
+PERSON_CONF_THRESHOLD = 0.45      # YOLO confidence for person detection
 
 # Mask segmentation — GREEN HAT (HSV ranges, OpenCV uses H:0-180, S:0-255, V:0-255)
 GREEN_LOWER_1 = np.array([30, 40, 40])
@@ -64,19 +63,17 @@ GREEN_UPPER_1 = np.array([90, 255, 255])
 
 # Mask segmentation — PINK/MAGENTA SWEATER
 # Hot pink spans both ends of the hue wheel
-PINK_LOWER_1 = np.array([145, 30, 50])    # magenta side
+PINK_LOWER_1 = np.array([145, 100, 50])    # magenta side
 PINK_UPPER_1 = np.array([180, 255, 255])
-PINK_LOWER_2 = np.array([0, 30, 50])      # red-pink wrap
+PINK_LOWER_2 = np.array([0, 100, 50])      # red-pink wrap
 PINK_UPPER_2 = np.array([12, 255, 255])
 
 # Mask quality thresholds
 MIN_HAT_MASK_AREA = 200           # minimum pixels for hat mask
 MIN_SWEATER_MASK_AREA = 300       # minimum pixels for sweater mask
 MIN_HAT_COVERAGE = 0.005          # hat area / person bbox area
-MAX_MASK_DISTANCE_FROM_BBOX = 1.5 # mask centroid must be within 1.5x bbox dimensions
 
 # SAHI settings for person detection
-USE_SAHI = True
 SAHI_SLICE_SIZE = 960
 SAHI_OVERLAP = 0.3
 
@@ -532,68 +529,163 @@ def mask_overlaps_bbox(mask, bbox, min_overlap_ratio=0.0):
 # PERSON DETECTION
 # ═══════════════════════════════════════════════════════════════
 
-def init_detector(use_sahi=True):
-    """Initialize person detector."""
-    if use_sahi:
-        from sahi import AutoDetectionModel
-        logger.info("Initializing YOLOv8m with SAHI...")
-        model = AutoDetectionModel.from_pretrained(
+# Path to VisDrone fine-tuned model (optional — runs without it)
+VISDRONE_MODEL_PATH = 'runs/detect/runs/detect/yolov8m-visdrone/weights/best.pt'
+
+
+def init_detectors():
+    """Initialize detectors for maximum person recall.
+    
+    Two complementary detectors:
+      1. COCO YOLO direct   — fast, good close range, standard perspectives
+      2. VisDrone SAHI tiled — aerial-optimized + tiled = best far-range aerial
+    
+    If VisDrone model doesn't exist yet (still training), falls back to COCO SAHI.
+    Any person found by either source counts. NMS merges duplicates.
+    """
+    from ultralytics import YOLO
+    from sahi import AutoDetectionModel
+    
+    logger.info("Initializing person detectors...")
+    
+    detectors = {}
+    
+    # ── COCO YOLOv8m direct (always available) ──
+    detectors['coco_yolo'] = YOLO('yolov8m.pt')
+    logger.info("  ✓ COCO YOLOv8m direct loaded")
+    
+    # ── VisDrone fine-tuned (optional but preferred) ──
+    visdrone_path = Path(VISDRONE_MODEL_PATH)
+    has_visdrone = visdrone_path.exists()
+    
+    if has_visdrone:
+        # VisDrone SAHI — the best combo for aerial small-person detection
+        detectors['visdrone_sahi'] = AutoDetectionModel.from_pretrained(
+            model_type='yolov8',
+            model_path=str(visdrone_path),
+            confidence_threshold=PERSON_CONF_THRESHOLD,
+            device='cuda:0'
+        )
+        logger.info(f"  ✓ VisDrone SAHI loaded from {visdrone_path}")
+    else:
+        # Fallback: COCO SAHI (worse for aerial, but better than nothing)
+        detectors['coco_sahi'] = AutoDetectionModel.from_pretrained(
             model_type='yolov8',
             model_path='yolov8m.pt',
             confidence_threshold=PERSON_CONF_THRESHOLD,
             device='cuda:0'
         )
-        return ('sahi', model)
-    else:
-        from ultralytics import YOLO
-        logger.info("Initializing YOLOv8m (direct)...")
-        model = YOLO('yolov8m.pt')
-        return ('yolo', model)
-
-
-def detect_persons(frame_bgr, detector, frame_path_for_sahi=None):
-    """Detect all person bounding boxes in a frame.
+        logger.info(f"  ✓ COCO SAHI loaded (fallback — VisDrone not found at {visdrone_path})")
+        logger.info(f"    Train VisDrone for better aerial detection: python train_visdrone.py")
     
-    Returns list of dicts: {bbox: [x1,y1,x2,y2], conf: float}
+    logger.info(f"  Active detectors: {list(detectors.keys())}")
+    return detectors
+
+
+def compute_iou(box_a, box_b):
+    """Compute IoU between two [x1,y1,x2,y2] boxes."""
+    x1 = max(box_a[0], box_b[0])
+    y1 = max(box_a[1], box_b[1])
+    x2 = min(box_a[2], box_b[2])
+    y2 = min(box_a[3], box_b[3])
+    
+    inter = max(0, x2 - x1) * max(0, y2 - y1)
+    area_a = (box_a[2] - box_a[0]) * (box_a[3] - box_a[1])
+    area_b = (box_b[2] - box_b[0]) * (box_b[3] - box_b[1])
+    union = area_a + area_b - inter
+    
+    return inter / union if union > 0 else 0.0
+
+
+def nms_merge(detections, iou_threshold=0.5):
+    """Merge overlapping detections from multiple sources.
+    
+    Two boxes with IoU > threshold are the same person — keep the
+    higher-confidence one. This prevents multiple detectors finding
+    the same mannequin from counting as 2+ persons.
     """
-    det_type, model = detector
+    if len(detections) <= 1:
+        return detections
     
-    if det_type == 'sahi':
-        from sahi.predict import get_sliced_prediction
-        # SAHI requires image on disk
-        if frame_path_for_sahi is None:
-            # Save temp
-            frame_path_for_sahi = '/tmp/_sahi_temp.png'
-            cv2.imwrite(frame_path_for_sahi, frame_bgr)
-        
-        result = get_sliced_prediction(
-            str(frame_path_for_sahi), model,
-            slice_height=SAHI_SLICE_SIZE,
-            slice_width=SAHI_SLICE_SIZE,
-            overlap_height_ratio=SAHI_OVERLAP,
-            overlap_width_ratio=SAHI_OVERLAP,
-            verbose=0,
-        )
-        persons = []
-        for pred in result.object_prediction_list:
-            if pred.category.id == 0:  # person class
-                bbox = pred.bbox.to_xyxy()
-                persons.append({
-                    'bbox': [float(b) for b in bbox],
-                    'conf': pred.score.value,
-                })
-        return persons
+    # Sort by confidence (highest first)
+    dets = sorted(detections, key=lambda d: d['conf'], reverse=True)
+    keep = []
     
-    else:  # direct YOLO
-        results = model.predict(frame_bgr, conf=PERSON_CONF_THRESHOLD, classes=[0], verbose=False)
-        persons = []
-        if len(results[0].boxes) > 0:
-            for box in results[0].boxes:
-                persons.append({
-                    'bbox': box.xyxy[0].cpu().numpy().tolist(),
-                    'conf': float(box.conf.cpu()),
-                })
-        return persons
+    while dets:
+        best = dets.pop(0)
+        keep.append(best)
+        # Remove anything that overlaps enough with the kept detection
+        remaining = []
+        for d in dets:
+            if compute_iou(best['bbox'], d['bbox']) < iou_threshold:
+                remaining.append(d)  # different person, keep for next round
+        dets = remaining
+    
+    return keep
+
+
+def detect_persons(frame_bgr, detectors, frame_path=None):
+    """Detect persons using two complementary detectors, then merge via NMS.
+    
+    Pass 1: COCO YOLO direct   — fast, good close range (classes=[0] person)
+    Pass 2: VisDrone SAHI tiled — aerial-optimized, good far range (classes 0+1)
+            Falls back to COCO SAHI if VisDrone model not available.
+    
+    Returns list of dicts: {bbox: [x1,y1,x2,y2], conf: float, source: str}
+    """
+    from sahi.predict import get_sliced_prediction
+    
+    all_detections = []
+    
+    # Ensure frame is on disk for SAHI
+    if frame_path is None:
+        frame_path = '/tmp/_sahi_temp.png'
+        cv2.imwrite(frame_path, frame_bgr)
+    
+    # ── Pass 1: COCO YOLO direct (always runs) ──
+    coco_model = detectors['coco_yolo']
+    results = coco_model.predict(frame_bgr, conf=PERSON_CONF_THRESHOLD, classes=[0], verbose=False)
+    if len(results[0].boxes) > 0:
+        for box in results[0].boxes:
+            all_detections.append({
+                'bbox': box.xyxy[0].cpu().numpy().tolist(),
+                'conf': float(box.conf.cpu()),
+                'source': 'coco_yolo',
+            })
+    
+    # ── Pass 2: SAHI tiled (VisDrone or COCO fallback) ──
+    if 'visdrone_sahi' in detectors:
+        sahi_model = detectors['visdrone_sahi']
+        # VisDrone person classes: 0=pedestrian, 1=people
+        person_class_ids = {0, 1}
+        sahi_source = 'visdrone_sahi'
+    else:
+        sahi_model = detectors['coco_sahi']
+        # COCO person class: 0
+        person_class_ids = {0}
+        sahi_source = 'coco_sahi'
+    
+    sahi_result = get_sliced_prediction(
+        str(frame_path), sahi_model,
+        slice_height=SAHI_SLICE_SIZE,
+        slice_width=SAHI_SLICE_SIZE,
+        overlap_height_ratio=SAHI_OVERLAP,
+        overlap_width_ratio=SAHI_OVERLAP,
+        verbose=0,
+    )
+    for pred in sahi_result.object_prediction_list:
+        if pred.category.id in person_class_ids:
+            bbox = pred.bbox.to_xyxy()
+            all_detections.append({
+                'bbox': [float(b) for b in bbox],
+                'conf': pred.score.value,
+                'source': sahi_source,
+            })
+    
+    # ── Merge: NMS deduplication ──
+    merged = nms_merge(all_detections, iou_threshold=0.5)
+    
+    return merged
 
 # ═══════════════════════════════════════════════════════════════
 # MAIN PROCESSING
@@ -642,6 +734,17 @@ def process_all(raw_dir, output_dir):
     # ── Find video segments in flight log ──
     segments = find_video_segments(df)
     
+    # ── Filter out tiny accidental segments (brief record/stop with no real MP4) ──
+    MIN_SEGMENT_DURATION = 10.0  # seconds
+    original_count = len(segments)
+    segments = [s for s in segments if s['duration_s'] >= MIN_SEGMENT_DURATION]
+    if len(segments) < original_count:
+        removed = original_count - len(segments)
+        logger.info(f"  Filtered out {removed} segment(s) shorter than {MIN_SEGMENT_DURATION}s (accidental record/stop)")
+        logger.info(f"  Remaining segments: {len(segments)}")
+        for i, seg in enumerate(segments):
+            logger.info(f"    Segment {i}: flyTime {seg['start_flyTime']:.1f}–{seg['end_flyTime']:.1f}s ({seg['duration_s']:.1f}s)")
+    
     # ── Match videos to segments ──
     if len(segments) == 0:
         logger.warning("No recording segments found via CAMERA.isVideo column!")
@@ -675,8 +778,8 @@ def process_all(raw_dir, output_dir):
         )
         logger.info(f"  Distance home→mannequin: {home_to_mannequin:.1f} m ({home_to_mannequin*3.281:.1f} ft)")
     
-    # ── Initialize detector ──
-    detector = init_detector(USE_SAHI)
+    # ── Initialize detectors (both YOLO and SAHI) ──
+    detectors = init_detectors()
     
     # ── Process each video ──
     all_frames = []
@@ -685,7 +788,6 @@ def process_all(raw_dir, output_dir):
     skip_stats = {
         'low_altitude': 0,
         'no_person': 0,
-        'multi_person': 0,
         'no_mask_at_all': 0,
         'no_telemetry': 0,
         'total_extracted': 0,
@@ -766,23 +868,40 @@ def process_all(raw_dir, output_dir):
             frame_path = frames_dir / f"{frame_id}.png"
             cv2.imwrite(str(frame_path), frame)
             
-            # ── Person detection ──
-            persons = detect_persons(frame, detector, frame_path_for_sahi=str(frame_path))
+            # ── Person detection (YOLO + SAHI union) ──
+            persons = detect_persons(frame, detectors, frame_path=str(frame_path))
             
             if len(persons) == 0:
                 skip_stats['no_person'] += 1
-                frame_path.unlink(missing_ok=True)  # delete temp frame
+                frame_path.unlink(missing_ok=True)
                 vid_frame_idx += 1
                 continue
+
+            # ── Find the person wearing the green hat or pink sweater ──
+            quick_hat = segment_green_hat(frame)
+            quick_sweater = segment_pink_sweater(frame)
             
-            if len(persons) > MAX_PERSONS_ALLOWED:
-                skip_stats['multi_person'] += 1
+            best_person = None
+            best_overlap = 0
+            for p in persons:
+                bx1, by1, bx2, by2 = [int(b) for b in p['bbox']]
+                h, w = quick_hat.shape[:2]
+                bx1, by1 = max(bx1, 0), max(by1, 0)
+                bx2, by2 = min(bx2, w), min(by2, h)
+                hat_roi = quick_hat[by1:by2, bx1:bx2]
+                sweater_roi = quick_sweater[by1:by2, bx1:bx2]
+                overlap = np.count_nonzero(hat_roi) + np.count_nonzero(sweater_roi)
+                if overlap > best_overlap:
+                    best_overlap = overlap
+                    best_person = p
+            
+            if best_person is None or best_overlap < MIN_HAT_MASK_AREA:
+                skip_stats['no_person'] += 1
                 frame_path.unlink(missing_ok=True)
                 vid_frame_idx += 1
                 continue
             
-            # Exactly 1 person — use it
-            person = persons[0]
+            person = best_person
             person_bbox = person['bbox']
             person_conf = person['conf']
             
@@ -791,7 +910,7 @@ def process_all(raw_dir, output_dir):
             bbox_area = max((bx2 - bx1) * (by2 - by1), 1)
             
             # ── Segment green hat ──
-            hat_mask = segment_green_hat(frame)
+            hat_mask = quick_hat
             hat_mask = constrain_mask_to_bbox(hat_mask, person_bbox, expand=1.5)
             hat_area = np.count_nonzero(hat_mask)
             hat_on_person = mask_overlaps_bbox(hat_mask, person_bbox) if hat_area > 0 else False
@@ -801,7 +920,7 @@ def process_all(raw_dir, output_dir):
                           and hat_coverage >= MIN_HAT_COVERAGE)
             
             # ── Segment pink sweater ──
-            sweater_mask = segment_pink_sweater(frame)
+            sweater_mask = quick_sweater
             sweater_mask = constrain_mask_to_bbox(sweater_mask, person_bbox, expand=1.3)
             sweater_area = np.count_nonzero(sweater_mask)
             sweater_on_person = mask_overlaps_bbox(sweater_mask, person_bbox) if sweater_area > 0 else False
@@ -940,7 +1059,6 @@ def process_all(raw_dir, output_dir):
     logger.info(f"    └─ sweater only usable:    {skip_stats['kept_sweater_only']}")
     logger.info(f"  Skip — low altitude:         {skip_stats['low_altitude']}")
     logger.info(f"  Skip — no person detected:   {skip_stats['no_person']}")
-    logger.info(f"  Skip — multiple persons:     {skip_stats['multi_person']}")
     logger.info(f"  Skip — no usable mask:       {skip_stats['no_mask_at_all']}")
     logger.info(f"  Skip — no telemetry match:   {skip_stats['no_telemetry']}")
     
@@ -1082,14 +1200,12 @@ if __name__ == '__main__':
     parser.add_argument('--raw', type=str, default=str(RAW_DIR), help='Directory with MP4s and flight log CSV')
     parser.add_argument('--output', type=str, default=str(OUTPUT_DIR), help='Output directory for dataset')
     parser.add_argument('--fps', type=int, default=EXTRACT_FPS, help='Frame extraction rate (frames/sec)')
-    parser.add_argument('--no-sahi', action='store_true', help='Use direct YOLO instead of SAHI')
     parser.add_argument('--mannequin-height', type=float, default=MANNEQUIN_HEIGHT_FT, help='Mannequin height in feet')
     args = parser.parse_args()
     
     RAW_DIR = Path(args.raw)
     OUTPUT_DIR = Path(args.output)
     EXTRACT_FPS = args.fps
-    USE_SAHI = not args.no_sahi
     MANNEQUIN_HEIGHT_FT = args.mannequin_height
     MANNEQUIN_HEIGHT_M = MANNEQUIN_HEIGHT_FT * 0.3048
     
