@@ -43,8 +43,8 @@ import re
 # ═══════════════════════════════════════════════════════════════
 
 # Paths (overridable via CLI args)
-RAW_DIR = Path('./RAW')
-OUTPUT_DIR = Path('./data/drone_footage')
+RAW_DIR = Path('./RAW_SAND')
+OUTPUT_DIR = Path('./data7/drone_footage')
 
 # Frame extraction
 EXTRACT_FPS = 5                   # frames per second to extract
